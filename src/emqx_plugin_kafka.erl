@@ -98,7 +98,7 @@ on_client_connected(ClientInfo = #{clientid := ClientId}, ConnInfo, _Env) ->
   Online = 1,
   Payload = [
     {action, Action},
-    {device_id, ClientId},
+    {clientid, ClientId},
     {username, maps:get(username, ClientInfo)},
     {keepalive, maps:get(keepalive, ConnInfo)},
     {ipaddress, iolist_to_binary(ntoa(IpAddr))},
@@ -107,7 +107,9 @@ on_client_connected(ClientInfo = #{clientid := ClientId}, ConnInfo, _Env) ->
     {timestamp, Now},
     {online, Online}
   ],
-  produce_kafka_payload(Payload),
+  Topic = list_to_binary([ekaf_get_topic(), <<"status">>]),
+  {ok, MessageBody} = emqx_json:safe_encode(Payload),
+  produce_kafka_payload(Topic, Action, MessageBody),
   ok.
 
 on_client_disconnected(ClientInfo = #{clientid := ClientId}, ReasonCode, ConnInfo, _Env) ->
@@ -118,13 +120,15 @@ on_client_disconnected(ClientInfo = #{clientid := ClientId}, ReasonCode, ConnInf
   Online = 0,
   Payload = [
     {action, Action},
-    {device_id, ClientId},
+    {clientid, ClientId},
     {username, maps:get(username, ClientInfo)},
     {reason, ReasonCode},
     {timestamp, Now},
     {online, Online}
   ],
-  produce_kafka_payload(Payload),
+  Topic = list_to_binary([ekaf_get_topic(), <<"status">>]),
+  {ok, MessageBody} = emqx_json:safe_encode(Payload),
+  produce_kafka_payload(Topic, Action, MessageBody),
   ok.
 
 on_client_authenticate(_ClientInfo = #{clientid := ClientId}, Result, _Env) ->
@@ -139,32 +143,10 @@ on_client_check_acl(_ClientInfo = #{clientid := ClientId}, Topic, PubSub, Result
 %%---------------------------client subscribe start--------------------------%%
 on_client_subscribe(#{clientid := ClientId}, _Properties, TopicFilters, _Env) ->
   ?LOG_INFO("[KAFKA PLUGIN]Client(~s) will subscribe: ~p~n", [ClientId, TopicFilters]),
-  Topic = erlang:element(1, erlang:hd(TopicFilters)),
-  Qos = erlang:element(2, lists:last(TopicFilters)),
-  Action = <<"subscribe">>,
-  Now = now_mill_secs(os:timestamp()),
-  Payload = [
-    {device_id, ClientId},
-    {action, Action},
-    {topic, Topic},
-    {qos, maps:get(qos, Qos)},
-    {timestamp, Now}
-  ],
-  produce_kafka_payload(Payload),
   ok.
 %%---------------------client subscribe stop----------------------%%
 on_client_unsubscribe(#{clientid := ClientId}, _Properties, TopicFilters, _Env) ->
   ?LOG_INFO("[KAFKA PLUGIN]Client(~s) will unsubscribe ~p~n", [ClientId, TopicFilters]),
-  Topic = erlang:element(1, erlang:hd(TopicFilters)),
-  Action = <<"unsubscribe">>,
-  Now = now_mill_secs(os:timestamp()),
-  Payload = [
-    {device_id, ClientId},
-    {action, Action},
-    {topic, Topic},
-    {timestamp, Now}
-  ],
-  produce_kafka_payload(Payload),
   ok.
 
 on_message_dropped(#message{topic = <<"$SYS/", _/binary>>}, _By, _Reason, _Env) ->
@@ -179,8 +161,11 @@ on_message_dropped(Message, _By = #{node := Node}, Reason, _Env) ->
 on_message_publish(Message = #message{topic = <<"$SYS/", _/binary>>}, _Env) ->
   ok;
 on_message_publish(Message, _Env) ->
-  {ok, Payload} = format_payload(Message),
-  produce_kafka_payload(Payload),
+  %%?LOG_INFO("[KAFKA PLUGIN]Client publish before produce, Message:~n~p~n",[Message]),
+  %%{ok, Payload} = format_payload(Message),
+  %%get_kafka_topic_produce(Message#message.topic, Payload),
+  %% produce_kafka_payload(<<"publish">>, Message#message.topic, Payload),
+  %%?LOG_INFO("[KAFKA PLUGIN]Client publish after produce, Payload:~n~p~n, Topic:~n~p~n",[Payload, Message#message.topic]),
   ok.
 %%---------------------message publish stop----------------------%%
 
@@ -189,20 +174,7 @@ on_message_delivered(_ClientInfo = #{clientid := ClientId}, Message, _Env) ->
     [ClientId, emqx_message:format(Message)]),
   Topic = Message#message.topic,
   Payload = Message#message.payload,
-  Qos = Message#message.qos,
-  From = Message#message.from,
-  Timestamp = Message#message.timestamp,
-  Content = [
-    {action, <<"message_delivered">>},
-    {from, From},
-    {to, ClientId},
-    {topic, Topic},
-    {payload, Payload},
-    {qos, Qos},
-    {cluster_node, node()},
-    {ts, Timestamp}
-  ],
-  produce_kafka_payload(Content),
+  get_kafka_topic_produce(Topic, Payload),
   ok.
 
 on_message_acked(_ClientInfo = #{clientid := ClientId}, Message, _Env) ->
@@ -210,20 +182,7 @@ on_message_acked(_ClientInfo = #{clientid := ClientId}, Message, _Env) ->
     [ClientId, emqx_message:format(Message)]),
   Topic = Message#message.topic,
   Payload = Message#message.payload,
-  Qos = Message#message.qos,
-  From = Message#message.from,
-  Timestamp = Message#message.timestamp,
-  Content = [
-    {action, <<"message_acked">>},
-    {from, From},
-    {to, ClientId},
-    {topic, Topic},
-    {payload, Payload},
-    {qos, Qos},
-    {cluster_node, node()},
-    {ts, Timestamp}
-  ],
-  produce_kafka_payload(Content),
+  get_kafka_topic_produce(Topic, Payload),
   ok.
 
 %%--------------------------------------------------------------------
@@ -287,32 +246,6 @@ ekaf_get_topic() ->
   Topic.
 
 
-format_payload(Message) ->
-  Username = emqx_message:get_header(username, Message),
-  Topic = Message#message.topic,
-  Tail = string:right(binary_to_list(Topic), 4),
-  RawType = string:equal(Tail, <<"_raw">>),
-  % ?LOG_INFO("[KAFKA PLUGIN]Tail= ~s , RawType= ~s~n",[Tail,RawType]),
-
-  MsgPayload = Message#message.payload,
-  % ?LOG_INFO("[KAFKA PLUGIN]MsgPayload : ~s~n", [MsgPayload]),
-  if
-    RawType == true ->
-      MsgPayload64 = list_to_binary(base64:encode_to_string(MsgPayload));
-  % ?LOG_INFO("[KAFKA PLUGIN]MsgPayload64 : ~s~n", [MsgPayload64]);
-    RawType == false ->
-      MsgPayload64 = MsgPayload
-  end,
-  Payload = [{action, message_publish},
-    {device_id, Message#message.from},
-    {username, Username},
-    {topic, Topic},
-    {payload, MsgPayload64},
-    {ts, Message#message.timestamp}],
-
-  {ok, Payload}.
-
-
 %% Called when the plugin application stop
 unload() ->
   emqx:unhook('client.connect', {?MODULE, on_client_connect}),
@@ -335,12 +268,47 @@ unload() ->
   emqx:unhook('message.acked', {?MODULE, on_message_acked}),
   emqx:unhook('message.dropped', {?MODULE, on_message_dropped}).
 
-produce_kafka_payload(Message) ->
-  Topic = ekaf_get_topic(),
-  {ok, MessageBody} = emqx_json:safe_encode(Message),
-  % ?LOG_INFO("[KAFKA PLUGIN]Message = ~s~n",[MessageBody]),
-  Payload = iolist_to_binary(MessageBody),
-  ekaf:produce_async_batched(Topic, Payload).
+produce_kafka_payload(Topic, Key, Payload) ->
+%%  Topic = ekaf_get_topic(),
+
+  ?LOG_INFO("[KAFKA PLUGIN]Message = ~s~n",[Payload]),
+  ekaf_lib:common_async(produce_async_batched, Topic, {Key,Payload}).
+
+get_kafka_topic_produce(Topic, Message) ->
+  ?LOG_INFO("[KAFKA PLUGIN]Kafka topic = -s-n", [Topic]),
+  TopicPrefix = string:left(binary_to_list(Topic),6),
+  TlinkFlag = string:equal(TopicPrefix, <<"tlink/">>),
+  if
+    TlinkFlag == true ->
+      TopicStr = binary_to_list(Topic),
+      OtaIndex = string:str(TopicStr,"ota"),
+      SubRegisterIndex = string:str(TopicStr,"sub/register"),
+      SubLogin = string:str(TopicStr,"sub/login"),
+      if
+        OtaIndex /= 0 ->
+          TopicKafka = list_to_binary([ekaf_get_topic(), <<"ota">>]);
+        SubRegisterIndex /= 0 ->
+          TopicKafka = list_to_binary([ekaf_get_topic(), <<"sub_register">>]);
+        SubLogin /= 0 ->
+          TopicKafka = list_to_binary([ekaf_get_topic(), <<"sub_status">>]);
+        OtaIndex + SubRegisterIndex + SubLogin == 0 ->
+          TopicKafka = list_to_binary([ekaf_get_topic(), <<"msg">>])
+      end,
+      produce_kafka_payload(TopicKafka, Topic, Message);
+    TlinkFlag == false ->
+      ?LOG_INFO("[KAFKA PLUGIN]MQTT topic prefix is not tlink = ~s~n",[Topic])
+  end,
+  ok.
+
+consume_kafka(Topic) ->
+  ?LOG_INFO("[KAFKA PLUGIN]Consuming kafka message"),
+  ekaf:pick(Topic,(a,b,c) ->
+    ?LOG_INFO("[KAFKA PLUGIN]Consuming kafka message a = ~s~n, b = ~s~n, c = ~s~n", a, b, c),
+    Msg = emqx_message:make(ClientId, Qos, Topic, Payload),
+    ?LOG_INFO("[KAFKA PLUGIN]Consuming kafka message = ~s~n", Msg),
+    emqx_broker:publish(Msg).
+  )
+
 
 ntoa({0, 0, 0, 0, 0, 16#ffff, AB, CD}) ->
   inet_parse:ntoa({AB bsr 8, AB rem 256, CD bsr 8, CD rem 256});
@@ -348,3 +316,4 @@ ntoa(IP) ->
   inet_parse:ntoa(IP).
 now_mill_secs({MegaSecs, Secs, _MicroSecs}) ->
   MegaSecs * 1000000000 + Secs * 1000 + _MicroSecs.
+
