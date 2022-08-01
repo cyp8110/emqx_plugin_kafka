@@ -107,7 +107,7 @@ on_client_connected(ClientInfo = #{clientid := ClientId}, ConnInfo, _Env) ->
     {timestamp, Now},
     {online, Online}
   ],
-  Topic = list_to_binary([brod_get_topic(), <<"status">>]),
+  Topic = list_to_binary([ekaf_get_topic(), <<"status">>]),
   {ok, MessageBody} = emqx_json:safe_encode(Payload),
   produce_kafka_payload(Topic, Action, MessageBody),
   ok.
@@ -126,7 +126,7 @@ on_client_disconnected(ClientInfo = #{clientid := ClientId}, ReasonCode, ConnInf
     {timestamp, Now},
     {online, Online}
   ],
-  Topic = list_to_binary([brod_get_topic(), <<"status">>]),
+  Topic = list_to_binary([ekaf_get_topic(), <<"status">>]),
   {ok, MessageBody} = emqx_json:safe_encode(Payload),
   produce_kafka_payload(Topic, Action, MessageBody),
   ok.
@@ -241,6 +241,11 @@ ekaf_init(_Env) ->
   % {ok, _} = application:ensure_all_started(ranch),
   {ok, _} = application:ensure_all_started(ekaf).
 
+ekaf_get_topic() ->
+  {ok, Topic} = application:get_env(ekaf, ekaf_bootstrap_topics),
+  Topic.
+
+
 %% Called when the plugin application stop
 unload() ->
   emqx:unhook('client.connect', {?MODULE, on_client_connect}),
@@ -263,41 +268,13 @@ unload() ->
   emqx:unhook('message.acked', {?MODULE, on_message_acked}),
   emqx:unhook('message.dropped', {?MODULE, on_message_dropped}).
 
+produce_kafka_payload(Topic, Key, Payload) ->
+%%  Topic = ekaf_get_topic(),
 
+  ?LOG_INFO("[KAFKA PLUGIN]Message = ~s~n",[Payload]),
+  ekaf_lib:common_async(produce_async_batched, Topic, {Key,Payload}).
 
-ntoa({0, 0, 0, 0, 0, 16#ffff, AB, CD}) ->
-  inet_parse:ntoa({AB bsr 8, AB rem 256, CD bsr 8, CD rem 256});
-ntoa(IP) ->
-  inet_parse:ntoa(IP).
-now_mill_secs({MegaSecs, Secs, _MicroSecs}) ->
-  MegaSecs * 1000000000 + Secs * 1000 + _MicroSecs.
-brod_get_topic() ->
-  {ok, Kafka} = application:get_env(?MODULE, broker),
-  Topic_prefix = proplists:get_value(payloadtopic, Kafka),
-  Topic_prefix.
-
-getPartition(Key) ->
-  {ok, Kafka} = application:get_env(?MODULE, broker),
-  PartitionNum = proplists:get_value(partition, Kafka),
-  <<Fix:120, Match:8>> = crypto:hash(md5, Key),
-  abs(Match) rem PartitionNum.
-
-produce_kafka_message(Topic, Message, ClientId, Env) ->
-  Key = iolist_to_binary(ClientId),
-  Partition = getPartition(Key),
-  %%JsonStr = jsx:encode(Message),
-  Kafka = proplists:get_value(broker, Env),
-  IsAsyncProducer = proplists:get_value(is_async_producer, Kafka),
-  if
-    IsAsyncProducer == false ->
-      brod:produce_sync(brod_client_1, Topic, Partition, ClientId, Message);
-    true ->
-      brod:produce_no_ack(brod_client_1, Topic, Partition, ClientId, Message)
-%%      brod:produce(brod_client_1, Topic, Partition, ClientId, JsonStr)
-  end,
-  ok.
-
-get_kafka_topic_produce(Topic, Message, Env) ->
+get_kafka_topic_produce(Topic, Message) ->
   ?LOG_INFO("[KAFKA PLUGIN]Kafka topic = -s-n", [Topic]),
   TopicPrefix = string:left(binary_to_list(Topic),6),
   TlinkFlag = string:equal(TopicPrefix, <<"tlink/">>),
@@ -309,138 +286,34 @@ get_kafka_topic_produce(Topic, Message, Env) ->
       SubLogin = string:str(TopicStr,"sub/login"),
       if
         OtaIndex /= 0 ->
-          TopicKafka = list_to_binary([brod_get_topic(), <<"ota">>]);
+          TopicKafka = list_to_binary([ekaf_get_topic(), <<"ota">>]);
         SubRegisterIndex /= 0 ->
-          TopicKafka = list_to_binary([brod_get_topic(), <<"sub_register">>]);
+          TopicKafka = list_to_binary([ekaf_get_topic(), <<"sub_register">>]);
         SubLogin /= 0 ->
-          TopicKafka = list_to_binary([brod_get_topic(), <<"sub_status">>]);
-        true ->
-          TopicKafka = list_to_binary([brod_get_topic(), <<"msg">>])
+          TopicKafka = list_to_binary([ekaf_get_topic(), <<"sub_status">>]);
+        OtaIndex + SubRegisterIndex + SubLogin == 0 ->
+          TopicKafka = list_to_binary([ekaf_get_topic(), <<"msg">>])
       end,
-      produce_kafka_message(TopicKafka, Message, Topic, Env);
+      produce_kafka_payload(TopicKafka, Topic, Message);
     TlinkFlag == false ->
       ?LOG_INFO("[KAFKA PLUGIN]MQTT topic prefix is not tlink = ~s~n",[Topic])
   end,
   ok.
 
-kafka_consume(Topics)->
-  GroupConfig = [{offset_commit_policy, commit_to_kafka_v2},
-    {offset_commit_interval_seconds, 5}
-  ],
-  GroupId = <<"emqx_cluster">>,
-  ConsumerConfig = [{begin_offset, earliest}],
-  brod:start_link_group_subscriber(brod_client_1, GroupId, Topics,
-    GroupConfig, ConsumerConfig,
-    _CallbackModule  = ?MODULE,
-    _CallbackInitArg = []).
+consume_kafka(Topic) ->
+  ?LOG_INFO("[KAFKA PLUGIN]Consuming kafka message"),
+  ekaf:pick(Topic,(a,b,c) ->
+    ?LOG_INFO("[KAFKA PLUGIN]Consuming kafka message a = ~s~n, b = ~s~n, c = ~s~n", a, b, c),
+    Msg = emqx_message:make(ClientId, Qos, Topic, Payload),
+    ?LOG_INFO("[KAFKA PLUGIN]Consuming kafka message = ~s~n", Msg),
+    emqx_broker:publish(Msg).
+  )
 
-handle_message(_Topic, Partition, Message, State) ->
-  #kafka_message{ offset = Offset
-    , key   = Key
-    , value = Value
-  } = Message,
-  error_logger:info_msg("~p ~p: offset:~w key:~s value:~s\n",
-    [self(), Partition, Offset, Key, Value]),
-  TopicStr = binary_to_list(_Topic),
-  MsgDown = string:equal(TopicStr,"tlink_device_msg_down"),
-  KickOut = string:equal(TopicStr,"tlink_device_kick_out"),
-  AclClean = string:equal(TopicStr,"tlink_device_acl_clean"),
-  if
-    MsgDown ->
-      handle_message_msg_down(Key, Value);
-    KickOut ->
-      {ok, UserName} = get_username(Value),
-      {ok, ClientList} = get_client_list_by_username(UserName),
-      kick_out(ClientList);
-    AclClean ->
-      {ok, UserName} = get_username(Value),
-      {ok, ClientList} = get_client_list_by_username(UserName),
-      acl_clean(ClientList);
-    true ->
-      error_logger:error_msg("the kafka comsume topic is not exist\n")
-  end,
-  error_logger:info_msg("message:~p\n",[Message]),
-  {ok, ack, State}.
 
-handle_message_msg_down(Key, Value) ->
-  Topic = Key,
-  Payload = Value,
-  Qos = 0,
-  Msg = emqx_message:make(<<"consume">>, Qos, Topic, Payload),
-  emqx_broker:safe_publish(Msg),
-  ok.
-
-get_username(Value) ->
-  {ok,Term} =  emqx_json:safe_decode(Value),
-  Map = maps:from_list(Term),
-  %% 获取消息体中数据
-  MessageUserName = maps:get(<<"username">>, Map),
-  MessageProductKey = maps:get(<<"username">>, Map),
-  MessageDeviceName = maps:get(<<"username">>, Map),
-  %% 获取数据是否存在
-  MessageUserNameLen = string:len(binary_to_list(MessageUserName)),
-  MessageProductKeyLen = string:len(binary_to_list(MessageProductKey)),
-  MessageDeviceNameLen = string:len(binary_to_list(MessageDeviceName)),
-  %% 确定最终username
-  if
-    MessageUserNameLen /= 0 ->
-      UserName = MessageUserName;
-    MessageProductKeyLen /= 0, MessageDeviceNameLen/= 0 ->
-      UserName = list_to_binary([MessageDeviceName, <<"&">>, MessageProductKey]);
-    true ->
-      UserName = <<"">>
-  end,
-  {ok, UserName}.
-
-get_client_list_by_username(UserName) ->
-  UserNameLen = string:len(binary_to_list(UserName)),
-  if
-    UserNameLen /= 0 ->
-      UserNameMap = #{
-        username => UserName
-      },
-      {ok, Client} = emqx_mgmt_api_clients:lookup(UserNameMap, {}),
-      %% 获取客户端list
-      ClientList = maps:get(data, Client);
-    true ->
-      ClientList = [],
-      error_logger:error_msg("the kafka comsume kick out username is not exist")
-  end,
-  {ok, ClientList}.
-
-kick_out(ClientList) ->
-  ClientListLength = length(ClientList),
-  if
-    ClientListLength > 0 ->
-      %% 遍历剔除clientid
-      lists:foreach(fun(C) ->
-        ClientId = maps:get(clientid, C),
-        ClientIdMap = #{
-          clientid => ClientId
-        },
-        emqx_mgmt_api_clients:kickout(ClientIdMap, {}) end,
-        ClientList
-      );
-    true ->
-      error_logger:error_msg("the kafka comsume kick out clientlist length is zero")
-  end,
-  ok.
-
-acl_clean(ClientList) ->
-  ClientListLength = length(ClientList),
-  if
-    ClientListLength > 0 ->
-      %% 遍历剔除clientid
-      lists:foreach(fun(C) ->
-        ClientId = maps:get(clientid, C),
-        ClientIdMap = #{
-          clientid => ClientId
-        },
-        emqx_mgmt_api_clients:clean_acl_cache(ClientIdMap, {}) end,
-        ClientList
-      );
-    true ->
-      error_logger:error_msg("the kafka comsume acl clean clientlist length is zero")
-  end,
-  ok.
+ntoa({0, 0, 0, 0, 0, 16#ffff, AB, CD}) ->
+  inet_parse:ntoa({AB bsr 8, AB rem 256, CD bsr 8, CD rem 256});
+ntoa(IP) ->
+  inet_parse:ntoa(IP).
+now_mill_secs({MegaSecs, Secs, _MicroSecs}) ->
+  MegaSecs * 1000000000 + Secs * 1000 + _MicroSecs.
 
